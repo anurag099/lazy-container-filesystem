@@ -1,88 +1,186 @@
-# Lazy Container Filesystem — Proof of Concept
+# Lazy Container Filesystem
 
-A small proof-of-concept demonstrating how a **read-only lazy filesystem** can reduce the amount of container image data that must be materialized before an application starts.
+A self-contained proof of concept for reducing container image startup cost by exposing a **read-only, content-addressed filesystem** that fetches file contents only when they are accessed.
 
-> **Assignment constraint:** This implementation does not use eStargz, Nydus, Dragonfly, or another existing lazy-image filesystem implementation.
-
-## Assignment goal
-
-The interview assignment asks for a filesystem that can help a container start faster by avoiding eager materialization of image content that the application never reads. A proof of concept is sufficient; a production container runtime or full OCI implementation is not required.
-
-## What this PoC implements
-
-The filesystem separates **metadata** from **file contents**:
+The project explores a simple idea:
 
 ```text
-                       metadata.json
-                  path -> SHA-256 digest
-                           |
-                           v
-Container/application -> Lazy FUSE filesystem
-                           |
-                    +------+------+
-                    |             |
-                cache hit      cache miss
-                    |             |
-                    v             v
-               local SSD     HTTP blob server
-                                  |
-                                  v
-                            SHA-256 verify
-                                  |
-                                  v
-                         atomic cache install
+Traditional:
+
+container image
+      ↓
+download / materialize everything
+      ↓
+start useful work
+
+
+Lazy filesystem:
+
+metadata
+      ↓
+mount filesystem
+      ↓
+start useful work
+      ↓
+fetch only files actually accessed
 ```
 
-For a file such as `/app/startup.txt`:
+The goal is to avoid spending startup time and bandwidth materializing large portions of an image that the workload never reads.
+
+## Overview
+
+A container image can contain a large number of files, while an application's startup path may require only a small subset of them.
+
+This PoC separates filesystem **metadata** from file **content**.
+
+The filesystem exposes normal paths such as:
 
 ```text
 /app/startup.txt
-       |
-       v
+/app/config.txt
+/data/large-unused.bin
+```
+
+but the actual file contents are stored separately as SHA-256-addressed blobs.
+
+When an application reads a file:
+
+1. The filesystem resolves the path to its content digest.
+2. It checks the local cache.
+3. On a cache miss, it fetches the blob over HTTP.
+4. It verifies the SHA-256 digest.
+5. It atomically installs the blob into the local cache.
+6. It returns the requested bytes to the application.
+
+The filesystem is implemented in user space using FUSE.
+
+## Architecture
+
+```text
+                         metadata.json
+                    path → SHA-256 digest
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │   Lazy FUSE FS   │
+                    └────────┬─────────┘
+                             │
+                    ┌────────┴────────┐
+                    │                 │
+                cache hit         cache miss
+                    │                 │
+                    ▼                 ▼
+              local cache       HTTP Blob Server
+                                      │
+                                      ▼
+                               SHA-256 verification
+                                      │
+                                      ▼
+                              atomic cache install
+                                      │
+                                      ▼
+                               return file data
+```
+
+For `/app/startup.txt`:
+
+```text
+/app/startup.txt
+       │
+       ▼
 SHA-256 digest
-       |
-       +---- cache hit ----> local blob
-       |
-       +---- cache miss ---> GET /blob/<digest>
-                                  |
-                                  v
+       │
+       ├── cache hit ──────► local blob
+       │
+       └── cache miss ─────► GET /blob/<digest>
+                                  │
+                                  ▼
                               verify hash
-                                  |
-                                  v
+                                  │
+                                  ▼
                               cache blob
-                                  |
-                                  v
+                                  │
+                                  ▼
                             return file data
 ```
 
 ## Why content addressing?
 
-Each file is stored by SHA-256 content digest rather than path. This gives us two useful properties:
+Each file is stored using its SHA-256 content digest rather than its filesystem path.
 
-1. **Integrity:** the downloaded content must hash to the expected digest.
-2. **Deduplication:** identical file contents can share one blob and one cache entry.
+This provides two useful properties:
 
-A production implementation could place the same immutable blobs in an OCI registry or object store and share the local cache across workloads.
+### Integrity
 
-## Repository layout
+The filesystem knows the expected digest before downloading the content.
+
+If the downloaded bytes do not match the expected SHA-256 digest, the data is rejected.
+
+### Deduplication
+
+Identical file contents can share the same blob and cache entry even when referenced by different paths.
+
+A production implementation could store the same immutable blobs in object storage, a container registry, or behind a CDN.
+
+## Implementation
+
+The PoC uses:
+
+* **Python** for rapid prototyping
+* **FUSE / fusepy** for the user-space filesystem
+* **SHA-256** for content addressing and integrity verification
+* **HTTP** for the blob transport
+* **Local filesystem cache** for repeated reads
+* **Docker** for the application workload
+
+The implementation is intentionally self-contained and does not depend on an existing lazy-image filesystem implementation.
+
+## Repository structure
 
 ```text
-filesystem/   Read-only FUSE filesystem and lazy fetch/cache logic
-registry/     Tiny local HTTP blob server
-scripts/      Synthetic image/manifest generator
-benchmark/    Eager vs lazy working-set benchmark
-container/    Docker workload used by the demo
-docs/         Design and reproducible demo instructions
+lazy-container-fs/
+├── filesystem/
+│   └── lazy_fs.py          # Read-only FUSE filesystem
+├── registry/
+│   └── server.py           # Local HTTP blob server
+├── scripts/
+│   └── create_image.py     # Synthetic image generator
+├── benchmark/
+│   └── benchmark.py        # Eager vs lazy benchmark
+├── container/
+│   ├── Dockerfile
+│   └── workload.py         # Container workload
+├── docs/
+│   ├── design.md
+│   └── demo.md
+├── .gitignore
+├── Makefile
+├── README.md
+└── requirements.txt
 ```
 
-## Linux setup
+## Requirements
 
-Linux is recommended because FUSE and container filesystem integration are Linux primitives. The demonstrated environment was Ubuntu 24.04 on an ARM64 Linux machine running under OrbStack on an Apple Silicon Mac.
+The PoC targets Linux because FUSE and container filesystem integration are Linux-oriented primitives.
 
-Install:
+Tested with:
+
+* Ubuntu 24.04
+* ARM64 / AArch64
+* Python 3.12
+* Docker Engine
+* FUSE 3
+* `fusepy`
+
+The demonstrated environment used an Ubuntu Linux machine running under OrbStack on an Apple Silicon Mac.
+
+## Setup
+
+Install the system dependencies:
 
 ```bash
 sudo apt update
+
 sudo apt install -y \
   fuse3 \
   libfuse3-dev \
@@ -98,10 +196,15 @@ Create the Python environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-If Docker needs to access a FUSE mount created by the current user, enable `allow_other`:
+### FUSE access for Docker
+
+The FUSE filesystem can be mounted with `--allow-other` so Docker can access the mounted filesystem.
+
+Enable the required FUSE setting:
 
 ```bash
 sudo sh -c 'grep -qxF "user_allow_other" /etc/fuse.conf || echo "user_allow_other" >> /etc/fuse.conf'
@@ -118,7 +221,13 @@ python3 scripts/create_image.py \
   --large-mb 200
 ```
 
-The generated image contains a small startup working set plus a 200 MiB file that the workload deliberately never reads.
+This generates a synthetic content-addressed image containing:
+
+* small application startup files;
+* thousands of additional files;
+* a 200 MiB file that the application never reads.
+
+The generated image is intentionally excluded from Git using `.gitignore`.
 
 ### 2. Start the blob server
 
@@ -145,27 +254,43 @@ python3 filesystem/lazy_fs.py \
   /tmp/lazy-root
 ```
 
-### 4. Prove lazy fetching
+The filesystem is mounted read-only.
+
+### 4. Demonstrate lazy fetching
 
 Terminal 3:
 
 ```bash
 du -sh /tmp/lazy-cache
-# expected: 0
-
-cat /tmp/lazy-root/app/startup.txt
-
-du -sh /tmp/lazy-cache
-# expected: a small cache entry now exists
 ```
 
-Reading the same file again uses the local cache.
+Initially the cache should be empty.
 
-### 5. Build and run the container workload
+Read a startup file:
+
+```bash
+cat /tmp/lazy-root/app/startup.txt
+```
+
+Then inspect the cache:
+
+```bash
+find /tmp/lazy-cache -type f -printf '%f %s bytes\n'
+```
+
+Only the accessed blob should have been fetched and cached.
+
+Reading the same file again is served from the local cache.
+
+### 5. Run the container workload
+
+Build the workload:
 
 ```bash
 docker build -t lazy-fs-workload container/
 ```
+
+Run it:
 
 ```bash
 docker run --rm \
@@ -173,11 +298,18 @@ docker run --rm \
   lazy-fs-workload
 ```
 
-The container reads `/image/app/startup.txt` and `/image/app/config.txt` through the lazy filesystem.
+The container reads:
+
+```text
+/image/app/startup.txt
+/image/app/config.txt
+```
+
+through the lazy filesystem.
 
 ## Benchmark
 
-With the same synthetic image used in the demo:
+Run:
 
 ```bash
 python3 benchmark/benchmark.py \
@@ -188,87 +320,221 @@ python3 benchmark/benchmark.py \
   --cache /tmp/lazy-cache
 ```
 
-### Observed result from the demo environment
+The benchmark compares:
+
+* eager materialization of the complete logical image;
+* lazy access to the startup working set;
+* warm-cache access after the required blobs have already been fetched.
+
+### Observed result
+
+Measured in the demonstrated environment:
 
 ```text
 Logical image content: 204.96 MiB
 
-EAGER materialization: 0.8966s
-EAGER bytes materialized: 204.96 MiB
+EAGER materialization:
+  0.8966s
+  204.96 MiB materialized
 
-LAZY cold startup working set: 0.0736s
-LAZY requested bytes: 0.000071 MiB
-LAZY bytes downloaded/cached: 0.000071 MiB
+LAZY cold startup working set:
+  0.0736s
+  0.000071 MiB requested
+  0.000071 MiB downloaded/cached
 
-LAZY warm-cache startup working set: 0.0004s
-Cache size after test: 74 bytes
+LAZY warm-cache startup working set:
+  0.0004s
+
+Cache size after test:
+  74 bytes
 ```
 
-The lazy filesystem fetched **74 bytes** for the startup working set instead of materializing the full **204.96 MiB** synthetic image — about **99.99997% less data** in this benchmark.
+The lazy path fetched **74 bytes** for the startup working set instead of materializing the full **204.96 MiB** logical image.
 
-The benchmark's 0.8966s vs 0.0736s numbers measure **filesystem preparation/working-set access**, not complete Docker container startup. The Docker command was also measured separately during the demo, but because eager materialization was performed beforehand, those `docker run` timings are not a fair end-to-end image-startup comparison.
+That corresponds to approximately **99.99997% less data materialized** in this synthetic workload.
 
-## Design decisions and trade-offs
+### Benchmark interpretation
 
-### Read-only
+The benchmark demonstrates the reduction in data that must be materialized before the startup working set is available.
 
-The PoC is intentionally read-only. Container image content is treated as immutable, which removes write-back and consistency complexity from the first implementation.
+It does **not** claim that the measured `0.8966s → 0.0736s` difference represents complete Docker container startup time.
+
+The Docker container itself was also executed successfully against the mounted filesystem, but the current PoC does not replace Docker's OCI image pull/extraction or snapshotter path.
+
+The blob server runs over local HTTP in this demonstration, so the benchmark focuses on filesystem behavior and data volume rather than real-world WAN latency or remote object-store performance.
+
+## Design decisions
+
+### Read-only filesystem
+
+The PoC is intentionally read-only.
+
+Container image content is treated as immutable, which removes write-back, consistency, and copy-on-write complexity from the initial implementation.
 
 ### FUSE
 
-FUSE lets us implement filesystem behavior in user space while presenting normal POSIX-style paths to applications. This makes it practical to prove the lazy-read mechanism without writing a kernel filesystem.
+FUSE allows filesystem behavior to be implemented in user space while exposing normal filesystem paths to applications.
+
+This provides a practical way to validate the lazy-read architecture without implementing a kernel filesystem.
 
 ### Content-addressed blobs
 
-SHA-256 provides immutable object IDs and integrity verification. It also enables deduplication when different paths or images reference identical content.
+SHA-256 provides:
+
+* immutable object identifiers;
+* integrity verification;
+* deduplication opportunities.
 
 ### Local cache
 
-Once a blob is fetched and verified, subsequent reads avoid another network request. A production cache would need an eviction policy, quotas, persistence rules, and concurrency coordination.
+Fetched blobs are stored locally after successful verification.
+
+A production cache would require additional policies such as:
+
+* eviction;
+* size limits;
+* persistence;
+* concurrent request coordination;
+* cache warming or prefetching.
 
 ### HTTP transport
 
-A tiny HTTP server keeps the PoC self-contained. In production, the blob source could be backed by an OCI registry, object storage, or a CDN layer.
+A tiny HTTP server keeps the PoC self-contained.
+
+A production system could replace it with:
+
+```text
+OCI registry
+object storage
+CDN
+authenticated blob service
+```
+
+without changing the fundamental filesystem abstraction.
 
 ### Python
 
-Python was chosen for rapid prototyping. A production filesystem datapath could move the hot path to Rust or C if profiling showed Python overhead to be material.
+Python was chosen for rapid prototyping and clarity.
+
+A production implementation could move the data path to Rust or C if profiling showed that Python overhead was significant.
 
 ## Failure modes considered
 
-- Missing blob -> I/O error to the application.
-- Network request failure -> I/O error; partial data is not installed as the final cache entry.
-- Digest mismatch -> I/O error; corrupted data is discarded.
-- Concurrent cache writers -> atomic temporary-file + rename avoids exposing partial blobs.
-- Workload reads most of the image -> lazy loading may provide little or no benefit; prefetching could be added.
+### Missing blob
+
+The filesystem returns an I/O error to the application.
+
+### Network failure
+
+A failed fetch returns an I/O error and does not expose partial data.
+
+### Digest mismatch
+
+Downloaded data is rejected when the SHA-256 digest does not match the metadata.
+
+### Concurrent cache writers
+
+Blob downloads use a temporary file followed by an atomic rename so readers do not observe partially written cache entries.
+
+### Workload reads most of the image
+
+Lazy loading is most beneficial when the startup working set is much smaller than the total image.
+
+If an application eventually reads most of the image, the benefit decreases and may disappear. A production implementation could add prefetching based on workload characteristics.
 
 ## Limitations
 
-This is deliberately a PoC, not a production container filesystem. It does not implement:
+This is a proof of concept rather than a production container filesystem.
 
-- full POSIX filesystem semantics;
-- OCI image/layer parsing;
-- direct containerd/runc snapshotter integration;
-- distributed cache coordination;
-- cache eviction/quotas;
-- authentication or encryption;
-- resumable downloads;
-- write support.
+It does not currently implement:
 
-The current Docker demo mounts the lazy filesystem into the container at `/image`. A production version would integrate the same lazy-rootfs concept at the container runtime/image snapshotter layer so the container's actual root filesystem could be backed by on-demand remote content.
+* full POSIX filesystem semantics;
+* OCI image or layer parsing;
+* direct containerd/runc snapshotter integration;
+* distributed cache coordination;
+* cache eviction or quotas;
+* authentication or encryption;
+* resumable downloads;
+* write support;
+* remote object-store integration.
 
-## What the PoC demonstrates
+The current Docker demo mounts the lazy filesystem inside the container at `/image`.
 
-The central result is architectural:
+A production version would integrate the lazy root filesystem concept with the container runtime or image snapshotter so that the actual container root filesystem could be backed by on-demand remote content.
+
+## Future work
+
+A production-oriented design could extend the PoC with:
 
 ```text
-Traditional approach:
-
-image -> download/materialize complete filesystem -> start useful work
-
-Lazy approach:
-
-metadata -> mount filesystem -> start process -> fetch only accessed files
+                  OCI Registry / Object Store
+                           │
+                           ▼
+                    Lazy Snapshotter
+                           │
+                    ┌──────┴──────┐
+                    │ Local Cache  │
+                    └──────┬──────┘
+                           │
+                           ▼
+                     Container Rootfs
 ```
 
-The benefit depends on the size of the startup working set relative to the complete image and on network latency/cache locality. The PoC intentionally makes that trade-off measurable instead of assuming every workload becomes faster.
+Potential improvements include:
+
+* OCI manifest and layer support;
+* direct containerd integration;
+* parallel range/blob fetching;
+* request coalescing for concurrent misses;
+* LRU or size-aware cache eviction;
+* prefetching;
+* remote cache sharing;
+* authentication and encrypted transport;
+* metrics for cache hit rate, fetch latency, and startup working-set size.
+
+## Demo
+
+A short demo video will show:
+
+1. generation of the synthetic image;
+2. starting the blob server;
+3. mounting the FUSE filesystem;
+4. an empty cache before file access;
+5. lazy fetching of `startup.txt`;
+6. the resulting cache entry;
+7. a cache hit on the second read;
+8. the Docker workload reading files through the lazy filesystem;
+9. benchmark results.
+
+**Demo video:** `TODO — add link before submission`
+
+## Summary
+
+The key idea demonstrated by this PoC is simple:
+
+```text
+Eager:
+
+image
+  ↓
+materialize everything
+  ↓
+start useful work
+
+
+Lazy:
+
+metadata
+  ↓
+mount filesystem
+  ↓
+start useful work
+  ↓
+fetch only accessed files
+  ↓
+cache locally
+```
+
+The benefit depends on the relationship between the complete image size and the application's actual startup working set.
+
+This PoC makes that trade-off measurable while keeping the implementation small enough to reason about and extend.
