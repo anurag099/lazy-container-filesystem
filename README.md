@@ -491,21 +491,6 @@ Potential improvements include:
 * authentication and encrypted transport;
 * metrics for cache hit rate, fetch latency, and startup working-set size.
 
-## Demo
-
-A short demo video will show:
-
-1. generation of the synthetic image;
-2. starting the blob server;
-3. mounting the FUSE filesystem;
-4. an empty cache before file access;
-5. lazy fetching of `startup.txt`;
-6. the resulting cache entry;
-7. a cache hit on the second read;
-8. the Docker workload reading files through the lazy filesystem;
-9. benchmark results.
-
-**Demo video:** `TODO — add link before submission`
 
 ## Summary
 
