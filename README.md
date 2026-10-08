@@ -314,7 +314,6 @@ Run:
 ```bash
 python3 benchmark/benchmark.py \
   --image demo-image \
-  --blob-url http://127.0.0.1:9000/blob \
   --lazy-root /tmp/lazy-root \
   --eager-root /tmp/eager-root \
   --cache /tmp/lazy-cache
